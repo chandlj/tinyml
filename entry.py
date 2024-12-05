@@ -28,7 +28,7 @@ from .auto_scale import auto_scale_block, apply_scale
 from .auto_clip import auto_clip_block, apply_clip
 from awq.utils.module import append_str_prefix, get_op_name
 from awq.utils.calib_data import get_calib_dataset
-
+from awq.quantize.quantizer import pseudo_quantize_tensor
 
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, W8A8Linear)}
@@ -285,3 +285,44 @@ awq_results = run_awq(
 model = model.to("cuda")
 acc_w4a8 = evaluator.evaluate(model)
 print(f"W4A8 acc: {acc_w4a8}")
+
+
+@torch.no_grad()
+def quantize_act_reorder(a, n_bits=4, outlier_ratio = 0.5):
+    importance = a.view(-1, a.shape[-1]).abs().mean(dim=0)
+
+    # Sort the importance and reorder the weight tensor
+    indices = torch.argsort(importance, descending=True)
+    a = a[..., indices]
+
+    # Quantize the activations
+    topk = int(importance.numel() * outlier_ratio)
+    a_outliers = a[..., :topk].clone()
+    a = pseudo_quantize_tensor(a, n_bit=n_bits, q_group_size=128)
+    a[..., :topk] = a_outliers
+
+    # Reorder the weight tensor back
+    un_indices = torch.argsort(indices)
+    a = a[..., un_indices]
+    return a
+
+
+@torch.no_grad()
+def forward(self, x):
+    q_x = self.act_quant(x)
+    q_x = quantize_act_reorder(q_x, n_bits=4)
+    y = torch.functional.F.linear(q_x, self.weight, self.bias)
+
+    q_y = self.output_quant(y)
+    q_y = quantize_act_reorder(q_y, n_bits=4)
+    return q_y
+
+import types
+
+for name, module in model.named_modules():
+    if isinstance(module, W8A8Linear):
+        module.forward = types.MethodType(forward, module)
+
+model = model.to("cuda")
+acc_w4a4 = evaluator.evaluate(model)
+print(f"W4A4 acc: {acc_w4a4}")
