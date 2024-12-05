@@ -264,6 +264,10 @@ evaluator = Evaluator(dataset, tokenizer, "cuda")
 model = OPTForCausalLM.from_pretrained(
     "facebook/opt-1.3b", torch_dtype=torch.float16, device_map="auto"
 )
+model = model.to("cuda")
+acc_fp16 = evaluator.evaluate(model)
+print(f"FP16 acc: {acc_fp16}")
+
 scales = torch.load("./smoothquant/act_scales/opt-1.3b.pt")
 smooth_lm(model, scales, alpha=0.5)
 model = quantize_model(model)
@@ -276,7 +280,6 @@ awq_results = run_awq(
     n_samples=128,
     seqlen=512,
 )
-print(awq_results)
 
 # W8A8 Model
 model = model.to("cuda")
