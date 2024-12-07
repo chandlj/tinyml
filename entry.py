@@ -219,12 +219,54 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048, outlier_ratio
     
     return results
 
+def process_all_models(mode, output_dir="./awq_results", w_bit=4, seqlen=2048, outlier_ratio=0.5):
+    """Process all models in batch mode."""
+    results = {}
+    
+    for model_name in MODEL_CONFIGS.keys():
+        print(f"\n{'='*80}")
+        print(f"Processing {model_name}")
+        print(f"{'='*80}\n")
+        
+        try:
+            if mode == "quantize":
+                quantize_and_save_awq(
+                    model_name,
+                    output_dir,
+                    w_bit=w_bit,
+                    seqlen=seqlen
+                )
+            else:  # test mode
+                model_id = model_name.split('/')[-1]
+                awq_path = os.path.join(output_dir, f"{model_id}_awq.pt")
+                if not os.path.exists(awq_path):
+                    print(f"Skipping {model_name}: AWQ results not found at {awq_path}")
+                    continue
+                    
+                results[model_name] = load_and_test_model(
+                    model_name,
+                    awq_path,
+                    seqlen=seqlen,
+                    outlier_ratio=outlier_ratio
+                )
+        except Exception as e:
+            print(f"Error processing {model_name}: {str(e)}")
+            continue
+    
+    if mode == "test" and results:
+        print("\nSummary of Results:")
+        print("="*80)
+        for model_name, result in results.items():
+            print(f"{model_name}:")
+            print(f"  Perplexity: {result['ppl']:.2f}")
+        print("="*80)
+
 def main():
     parser = argparse.ArgumentParser(description="Quantize models using AWQ or test perplexity")
     parser.add_argument("--mode", choices=["quantize", "test"], required=True,
                       help="Mode: 'quantize' to run AWQ or 'test' to evaluate perplexity")
-    parser.add_argument("--model", required=True, choices=list(MODEL_CONFIGS.keys()),
-                      help="Model name to quantize/test")
+    parser.add_argument("--model", choices=list(MODEL_CONFIGS.keys()) + ["all"],
+                      help="Model name to quantize/test, or 'all' for batch processing")
     parser.add_argument("--output-dir", default="./awq_results",
                       help="Directory to save AWQ results (for quantize mode)")
     parser.add_argument("--awq-results", 
@@ -238,24 +280,41 @@ def main():
     
     args = parser.parse_args()
     
-    if args.mode == "quantize":
-        quantize_and_save_awq(
-            args.model,
-            args.output_dir,
+    if args.model == "all":
+        process_all_models(
+            args.mode,
+            output_dir=args.output_dir,
             w_bit=args.w_bit,
-            seqlen=args.seqlen
-        )
-    else:  # test mode
-        if not args.awq_results:
-            parser.error("--awq-results is required for test mode")
-        if not 0.0 <= args.outlier_ratio <= 1.0:
-            parser.error("--outlier-ratio must be between 0.0 and 1.0")
-        load_and_test_model(
-            args.model,
-            args.awq_results,
             seqlen=args.seqlen,
             outlier_ratio=args.outlier_ratio
         )
+    else:
+        if not args.model:
+            parser.error("--model is required")
+            
+        if args.mode == "quantize":
+            quantize_and_save_awq(
+                args.model,
+                args.output_dir,
+                w_bit=args.w_bit,
+                seqlen=args.seqlen
+            )
+        else:  # test mode
+            if not args.awq_results:
+                model_id = args.model.split('/')[-1]
+                args.awq_results = os.path.join(args.output_dir, f"{model_id}_awq.pt")
+                if not os.path.exists(args.awq_results):
+                    parser.error(f"AWQ results file not found: {args.awq_results}")
+            
+            if not 0.0 <= args.outlier_ratio <= 1.0:
+                parser.error("--outlier-ratio must be between 0.0 and 1.0")
+            
+            load_and_test_model(
+                args.model,
+                args.awq_results,
+                seqlen=args.seqlen,
+                outlier_ratio=args.outlier_ratio
+            )
 
 if __name__ == "__main__":
     main()
