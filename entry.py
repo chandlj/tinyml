@@ -180,14 +180,15 @@ def apply_activation_quantization(model, outlier_ratio=0.5):
             module.forward = types.MethodType(make_forward(module, outlier_ratio), module)
     return model
 
-def load_and_test_model(model_name, awq_results_path, seqlen=2048, outlier_ratio=0.5):
-    """Load model with AWQ results and test perplexity."""
+def load_and_test_model(model_name, awq_results_path, seqlen=2048):
+    """Load model with AWQ results and test perplexity with different outlier ratios."""
+    results = {}
     
     # Load model and tokenizer
     model, tokenizer, config = get_model_and_tokenizer(model_name)
 
     print("Testing original model perplexity...")
-    test_perplexity(model, tokenizer, seqlen=seqlen)
+    results['original'] = test_perplexity(model, tokenizer, seqlen=seqlen)
 
     print("Applying SmoothQuant...")
     scales_path = os.path.join("./smoothquant/act_scales", config["act_scales"])
@@ -197,6 +198,9 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048, outlier_ratio
     scales = torch.load(scales_path, map_location=device)
     smooth_lm(model, scales, alpha=0.5)
     model = quantize_model(model)
+
+    print("Testing SmoothQuant model perplexity...")
+    results['smoothquant'] = test_perplexity(model, tokenizer, seqlen=seqlen)
     
     print("Applying AWQ...")
     # Load AWQ results and apply them
@@ -206,20 +210,45 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048, outlier_ratio
     model = model.to(device)
     
     print("Testing AWQ model perplexity...")
-    results = test_perplexity(model, tokenizer, seqlen=seqlen)
-    print(f"Perplexity results after AWQ: {results}")
+    results['awq'] = test_perplexity(model, tokenizer, seqlen=seqlen)
 
-    print(f"Applying activation quantization (outlier_ratio={outlier_ratio})...")
-    model = apply_activation_quantization(model, outlier_ratio=outlier_ratio)
-    model = model.to(device)
+    # Test different outlier ratios
+    outlier_ratios = [0.1, 0.25, 0.5, 0.75]
+    for ratio in outlier_ratios:
+        print(f"\nTesting outlier ratio {ratio}:")
+        
+        # Create a fresh copy of the model for this ratio
+        model_copy = type(model)(model.config)
+        model_copy.load_state_dict(model.state_dict())
+        model_copy = model_copy.to(device)
+        
+        print(f"Applying activation quantization (outlier_ratio={ratio})...")
+        model_copy = apply_activation_quantization(model_copy, outlier_ratio=ratio)
+        
+        print("Testing AWQ + activation quantization model perplexity...")
+        results[f'awq_act_quant_{ratio}'] = test_perplexity(model_copy, tokenizer, seqlen=seqlen)
+        
+        # Clean up
+        del model_copy
+        torch.cuda.empty_cache()
     
-    print("Testing AWQ + activation quantization model perplexity...")
-    results = test_perplexity(model, tokenizer, seqlen=seqlen)
-    print(f"Perplexity results after AWQ + activation quantization: {results}")
+    # Print summary of all results
+    print("\nSummary of all results:")
+    print("="*80)
+    print(f"Original model perplexity: {results['original']['ppl']:.2f}")
+    print(f"SmoothQuant model perplexity: {results['smoothquant']['ppl']:.2f}")
+    print(f"AWQ model perplexity: {results['awq']['ppl']:.2f}")
+    for ratio in outlier_ratios:
+        print(f"AWQ + Act Quant (ratio={ratio}) perplexity: {results[f'awq_act_quant_{ratio}']['ppl']:.2f}")
+    print("="*80)
+    
+    # Clean up original model
+    del model
+    torch.cuda.empty_cache()
     
     return results
 
-def process_all_models(mode, output_dir="./awq_results", w_bit=4, seqlen=2048, outlier_ratio=0.5):
+def process_all_models(mode, output_dir="./awq_results", w_bit=4, seqlen=2048):
     """Process all models in batch mode."""
     results = {}
     
@@ -247,7 +276,6 @@ def process_all_models(mode, output_dir="./awq_results", w_bit=4, seqlen=2048, o
                     model_name,
                     awq_path,
                     seqlen=seqlen,
-                    outlier_ratio=outlier_ratio
                 )
         except Exception as e:
             print(f"Error processing {model_name}: {str(e)}")
@@ -275,9 +303,6 @@ def main():
                       help="Sequence length for evaluation")
     parser.add_argument("--w-bit", type=int, default=4,
                       help="Number of bits for weight quantization")
-    parser.add_argument("--outlier-ratio", type=float, default=0.5,
-                      help="Ratio of activation values to keep in high precision (0.0 to 1.0)")
-    
     args = parser.parse_args()
     
     if args.model == "all":
@@ -286,7 +311,6 @@ def main():
             output_dir=args.output_dir,
             w_bit=args.w_bit,
             seqlen=args.seqlen,
-            outlier_ratio=args.outlier_ratio
         )
     else:
         if not args.model:
@@ -305,15 +329,11 @@ def main():
                 args.awq_results = os.path.join(args.output_dir, f"{model_id}_awq.pt")
                 if not os.path.exists(args.awq_results):
                     parser.error(f"AWQ results file not found: {args.awq_results}")
-            
-            if not 0.0 <= args.outlier_ratio <= 1.0:
-                parser.error("--outlier-ratio must be between 0.0 and 1.0")
-            
+
             load_and_test_model(
                 args.model,
                 args.awq_results,
                 seqlen=args.seqlen,
-                outlier_ratio=args.outlier_ratio
             )
 
 if __name__ == "__main__":
