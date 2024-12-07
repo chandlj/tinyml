@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 import tqdm
 from datasets import load_dataset
-from transformers import GPT2Tokenizer
+from transformers import AutoTokenizer
 from transformers.models.opt.modeling_opt import OPTForCausalLM
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 __package__ = "tinyml"
@@ -20,6 +20,50 @@ from .auto_clip import apply_clip
 from awq.quantize.quantizer import pseudo_quantize_tensor
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MODEL_CONFIGS = {
+    # OPT Models
+    "facebook/opt-125m": {"family": "opt", "act_scales": "opt-125m.pt"},
+    "facebook/opt-350m": {"family": "opt", "act_scales": "opt-350m.pt"},
+    "facebook/opt-1.3b": {"family": "opt", "act_scales": "opt-1.3b.pt"},
+    "facebook/opt-2.7b": {"family": "opt", "act_scales": "opt-2.7b.pt"},
+    "facebook/opt-6.7b": {"family": "opt", "act_scales": "opt-6.7b.pt"},
+    # Llama Models
+    "meta-llama/Llama-2-7b-hf": {"family": "llama", "act_scales": "llama-2-7b.pt"},
+    "meta-llama/Llama-2-13b-hf": {"family": "llama", "act_scales": "llama-2-13b.pt"},
+    "meta-llama/Llama-2-70b-hf": {"family": "llama", "act_scales": "llama-2-70b.pt"},
+}
+
+def get_model_and_tokenizer(model_name):
+    """Load appropriate model and tokenizer based on model family."""
+    if model_name not in MODEL_CONFIGS:
+        raise ValueError(f"Model {model_name} not supported. Supported models: {list(MODEL_CONFIGS.keys())}")
+    
+    config = MODEL_CONFIGS[model_name]
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if config["family"] == "llama" and tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load model
+    if config["family"] == "opt":
+        model_class = OPTForCausalLM
+    elif config["family"] == "llama":
+        model_class = LlamaForCausalLM
+    else:
+        raise ValueError(f"Unknown model family: {config['family']}")
+    
+    model = model_class.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="auto" if torch.cuda.is_available() else None
+    )
+    
+    if not torch.cuda.is_available():
+        model = model.to(device)
+    
+    return model, tokenizer, config
 
 def test_perplexity(model, tokenizer, seqlen=2048):
     """Test model perplexity on WikiText-2 dataset."""
@@ -56,17 +100,14 @@ def quantize_and_save_awq(model_name, output_dir, w_bit=4, seqlen=512):
     os.makedirs(output_dir, exist_ok=True)
 
     # Load model and tokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-    model = OPTForCausalLM.from_pretrained(
-        model_name, 
-        torch_dtype=torch.float16, 
-        device_map="auto" if torch.cuda.is_available() else None
-    )
-    if not torch.cuda.is_available():
-        model = model.to(device)
+    model, tokenizer, config = get_model_and_tokenizer(model_name)
     
     # Apply SmoothQuant
-    scales = torch.load("./smoothquant/act_scales/opt-1.3b.pt", map_location=device)
+    scales_path = os.path.join("./smoothquant/act_scales", config["act_scales"])
+    if not os.path.exists(scales_path):
+        raise FileNotFoundError(f"Activation scales file not found: {scales_path}")
+    
+    scales = torch.load(scales_path, map_location=device)
     smooth_lm(model, scales, alpha=0.5)
     model = quantize_model(model)
     
@@ -85,7 +126,9 @@ def quantize_and_save_awq(model_name, output_dir, w_bit=4, seqlen=512):
     test_perplexity(model, tokenizer, seqlen=seqlen)
     
     # Save results
-    torch.save(awq_results, os.path.join(output_dir, "awq_results.pt"))
+    os.makedirs(output_dir, exist_ok=True)
+    model_id = model_name.split('/')[-1]
+    torch.save(awq_results, os.path.join(output_dir, f"{model_id}_awq.pt"))
     print(f"AWQ results saved to {output_dir}")
 
 @torch.no_grad()
@@ -141,26 +184,20 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048, outlier_ratio
     """Load model with AWQ results and test perplexity."""
     
     # Load model and tokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-    model = OPTForCausalLM.from_pretrained(
-        model_name, 
-        torch_dtype=torch.float16,
-        device_map="auto" if torch.cuda.is_available() else None
-    )
-    if not torch.cuda.is_available():
-        model = model.to(device)
+    model, tokenizer, config = get_model_and_tokenizer(model_name)
 
     print("Testing original model perplexity...")
     test_perplexity(model, tokenizer, seqlen=seqlen)
 
     print("Applying SmoothQuant...")
-    # Apply SmoothQuant
-    scales = torch.load("./smoothquant/act_scales/opt-1.3b.pt", map_location=device)
+    scales_path = os.path.join("./smoothquant/act_scales", config["act_scales"])
+    if not os.path.exists(scales_path):
+        raise FileNotFoundError(f"Activation scales file not found: {scales_path}")
+    
+    scales = torch.load(scales_path, map_location=device)
     smooth_lm(model, scales, alpha=0.5)
     model = quantize_model(model)
-    print("Testing SmoothQuant model perplexity...")
-    test_perplexity(model, tokenizer, seqlen=seqlen)
-
+    
     print("Applying AWQ...")
     # Load AWQ results and apply them
     awq_results = torch.load(awq_results_path, map_location=device)
@@ -186,8 +223,8 @@ def main():
     parser = argparse.ArgumentParser(description="Quantize models using AWQ or test perplexity")
     parser.add_argument("--mode", choices=["quantize", "test"], required=True,
                       help="Mode: 'quantize' to run AWQ or 'test' to evaluate perplexity")
-    parser.add_argument("--model", default="facebook/opt-1.3b",
-                      help="Model name or path (default: facebook/opt-1.3b)")
+    parser.add_argument("--model", required=True, choices=list(MODEL_CONFIGS.keys()),
+                      help="Model name to quantize/test")
     parser.add_argument("--output-dir", default="./awq_results",
                       help="Directory to save AWQ results (for quantize mode)")
     parser.add_argument("--awq-results", 
