@@ -285,18 +285,6 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
             model, tokenizer, seqlen=seqlen
         )
 
-    # Print summary of all results
-    print("\nSummary of all results:")
-    print("=" * 80)
-    print(f"Original model perplexity: {results['original']['ppl']:.2f}")
-    print(f"SmoothQuant model perplexity: {results['smoothquant']['ppl']:.2f}")
-    print(f"AWQ model perplexity: {results['awq']['ppl']:.2f}")
-    for ratio in outlier_ratios:
-        print(
-            f"AWQ + Act Quant (ratio={ratio}) perplexity: {results[f'awq_act_quant_{ratio}']['ppl']:.2f}"
-        )
-    print("=" * 80)
-
     # Save results
     output_dir = "./results"
     os.makedirs(output_dir, exist_ok=True)
@@ -311,6 +299,18 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
 
     with open(os.path.join(output_dir, f"{model_id}_results.json"), "w") as f:
         json.dump(results, f)
+
+    # Print summary of all results
+    print("\nSummary of all results:")
+    print("=" * 80)
+    print(f"Original model perplexity: {results['original']['ppl']:.2f}")
+    print(f"SmoothQuant model perplexity: {results['smoothquant']['ppl']:.2f}")
+    print(f"AWQ model perplexity: {results['awq']['ppl']:.2f}")
+    for ratio in outlier_ratios:
+        print(
+            f"AWQ + Act Quant (ratio={ratio}) perplexity: {results[f'awq_act_quant_{ratio}']['ppl']:.2f}"
+        )
+    print("=" * 80)
 
     return results
 
