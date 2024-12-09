@@ -141,7 +141,7 @@ def get_calib_feat(model, tokenizer):
 
 
 @torch.no_grad()
-def quantize_act_reorder(a, n_bits=4, outlier_ratio=0.5):
+def quantize_act_reorder(a, n_bits=4, outlier_ratio=0.5, reorder_indices=None, unorder_indices=None):
     """Quantize activations with reordering for better precision on important values.
 
     Args:
@@ -149,50 +149,60 @@ def quantize_act_reorder(a, n_bits=4, outlier_ratio=0.5):
         n_bits: Number of bits for quantization
         outlier_ratio: Ratio of values to keep in high precision (0.0 to 1.0)
     """
-    importance = a.view(-1, a.shape[-1]).abs().mean(dim=0)
 
     # Sort the importance and reorder the weight tensor
-    indices = torch.argsort(importance, descending=True)
-    a = a[..., indices]
+    if reorder_indices is None:
+        importance = a.view(-1, a.shape[-1]).abs().mean(dim=0)
+        reorder_indices = torch.argsort(importance, descending=True)
+
+    a = a[..., reorder_indices]
 
     # Quantize the activations
-    topk = int(importance.numel() * outlier_ratio)
+    topk = int(reorder_indices.numel() * outlier_ratio)
     a_outliers = a[..., :topk].clone()
     a = pseudo_quantize_tensor(a, n_bit=n_bits, q_group_size=128)
     a[..., :topk] = a_outliers
 
     # Reorder the weight tensor back
-    un_indices = torch.argsort(indices)
-    a = a[..., un_indices]
+    if unorder_indices is None:
+        unorder_indices = torch.argsort(reorder_indices)
+
+    a = a[..., unorder_indices]
     return a
 
 
 @torch.no_grad()
-def forward_with_activation_quant(self, x, outlier_ratio=0.5):
+def forward_with_activation_quant(self, x, reorder_indices, unorder_indices, outlier_ratio=0.5):
     """Modified forward pass with activation quantization."""
     q_x = self.act_quant(x)
-    q_x = quantize_act_reorder(q_x, n_bits=4, outlier_ratio=outlier_ratio)
+    q_x = quantize_act_reorder(q_x, n_bits=4, outlier_ratio=outlier_ratio, reorder_indices=reorder_indices, unorder_indices=unorder_indices)
     y = torch.functional.F.linear(q_x, self.weight, self.bias)
 
     q_y = self.output_quant(y)
-    q_y = quantize_act_reorder(q_y, n_bits=4, outlier_ratio=outlier_ratio)
+    # q_y = quantize_act_reorder(q_y, n_bits=4, outlier_ratio=outlier_ratio)
     return q_y
 
 
-def apply_activation_quantization(model, outlier_ratio=0.5):
+def apply_activation_quantization(model, outlier_ratio=0.5, input_feat=None):
     """Apply activation quantization to all W8A8Linear layers."""
     import types
 
+    if input_feat is None:
+        raise ValueError("input_feat is required")
+
     for name, module in model.named_modules():
         if isinstance(module, W8A8Linear):
+            importance = sum(input_feat[name]).float()
+            reorder_indices = torch.argsort(importance, descending=True)
+            unorder_indices = torch.argsort(reorder_indices)
             # Create a closure to capture the outlier_ratio
-            def make_forward(module, outlier_ratio):
+            def make_forward(module, reorder_indices, unorder_indices, outlier_ratio):
                 return lambda self, x: forward_with_activation_quant(
-                    self, x, outlier_ratio
+                    self, x, reorder_indices, unorder_indices, outlier_ratio
                 )
 
             module.forward = types.MethodType(
-                make_forward(module, outlier_ratio), module
+                make_forward(module, reorder_indices, unorder_indices, outlier_ratio), module
             )
     return model
 
@@ -225,18 +235,18 @@ def quantize_and_save_awq(model_name, output_dir, w_bit=4, seqlen=512):
     for n, m in model.named_modules():
         if isinstance(m, W8A8Linear):
             importance = sum(input_feat[n]).float()
-            outlier_indices = torch.topk(
-                importance, int(importance.numel() * 0.01), largest=True
-            ).indices
-            assert outlier_indices.dim() == 1
+            reorder_indices = torch.argsort(importance, descending=True)
+            unorder_indices = torch.argsort(reorder_indices)
+            topk = int(reorder_indices.numel() * 0.01)
 
             # Back up the values of the salient weight channels
-
-            m.weight.data[:, outlier_indices] *= 2
+            m.weight.data = m.weight.data[:, reorder_indices]
+            m.weight.data[:, :topk] *= 2
             m.weight.data = pseudo_quantize_tensor(
                 m.weight.data, n_bit=w_bit, q_group_size=128
             )
-            m.weight.data[:, outlier_indices] = m.weight.data[:, outlier_indices] / 2
+            m.weight.data[:, :topk] = m.weight.data[:, :topk] / 2
+            m.weight.data = m.weight.data[:, unorder_indices]
 
     # Test perplexity
     print("Testing SmoothQuant + AWQ model perplexity...")
@@ -267,6 +277,15 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
     # https://pytorch.org/tutorials/recipes/recipes/module_load_state_dict_tips.html
     params_dict = torch.load(awq_results_path, mmap=True, weights_only=True, map_location="cpu")
 
+    model.load_state_dict(params_dict, assign=True)
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    model = model.to(device)
+
+    input_feat = get_calib_feat(model, tokenizer)
+
     # Test different outlier ratios
     outlier_ratios = [0.01, 0.05, 0.1, 0.25]
     for ratio in outlier_ratios:
@@ -283,7 +302,7 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
         model = model.to(device)
 
         print(f"Applying activation quantization (outlier_ratio={ratio})...")
-        model = apply_activation_quantization(model, outlier_ratio=ratio)
+        model = apply_activation_quantization(model, outlier_ratio=ratio, input_feat=input_feat)
 
         print("Testing AWQ + activation quantization model perplexity...")
         results[f"awq_act_quant_{ratio}"] = test_perplexity(
@@ -298,9 +317,10 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
     # Merge results with existing results
     if os.path.exists(os.path.join(output_dir, f"{model_id}_results.json")):
         with open(os.path.join(output_dir, f"{model_id}_results.json"), "r") as f:
-            existing_results = json.load(f)
+            existing_results: dict = json.load(f)
 
-        results.update(existing_results)
+        existing_results.update(results)
+        results = existing_results
 
     with open(os.path.join(output_dir, f"{model_id}_results.json"), "w") as f:
         json.dump(results, f)
