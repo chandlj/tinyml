@@ -1,6 +1,6 @@
 [submodule "smoothquant"]
 	path = smoothquant
-	url = git@github.com:chandlj/smoothquant.git
+	url = https://github.com/chandlj/smoothquant.git
 [submodule "llm-awq"]
 	path = llm-awq
-	url = git@github.com:chandlj/llm-awq.git
+	url = https://github.com/chandlj/llm-awq.git
