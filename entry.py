@@ -30,8 +30,6 @@ from .auto_clip import apply_clip
 from .auto_scale import apply_scale
 from .run_awq import run_awq
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 MODEL_CONFIGS = {
     # OPT Models
     "facebook/opt-125m": {"family": "opt", "act_scales": "opt-125m.pt"},
@@ -74,11 +72,8 @@ def get_model_and_tokenizer(model_name):
     model = model_class.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
-        device_map="auto" if torch.cuda.is_available() else None,
+        device_map="auto",
     )
-
-    if not torch.cuda.is_available():
-        model = model.to(device)
 
     return model, tokenizer, config
 
@@ -88,13 +83,13 @@ def test_perplexity(model, tokenizer, seqlen=2048):
     testenc = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     testenc = tokenizer("\n\n".join(testenc["text"]), return_tensors="pt")
     model.seqlen = seqlen
-    testenc = testenc.input_ids.to(device)
+    testenc = testenc.input_ids.to(model.device)
     nsamples = testenc.numel() // model.seqlen
     model = model.eval()
     nlls = []
 
     for i in tqdm.tqdm(range(nsamples), desc="evaluating..."):
-        batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(device)
+        batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(model.device)
         with torch.no_grad():
             lm_logits = model(batch).logits
         shift_logits = lm_logits[:, :-1, :].contiguous().float()
@@ -133,12 +128,11 @@ def get_calib_feat(model, tokenizer):
             )
 
     print("Collecting activation scales...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     samples = get_calib_dataset("pileval", tokenizer, n_samples=128, block_size=512)
     pbar = tqdm.tqdm(samples)
     for input_ids in pbar:
-        input_ids = input_ids.to(device)
+        input_ids = input_ids.to(model.device)
         model(input_ids)
 
     for hook in hooks:
@@ -219,7 +213,7 @@ def quantize_and_save_awq(model_name, output_dir, w_bit=4, seqlen=512):
     if not os.path.exists(scales_path):
         raise FileNotFoundError(f"Activation scales file not found: {scales_path}")
 
-    scales = torch.load(scales_path, map_location=device)
+    scales = torch.load(scales_path, map_location=model.device)
     smooth_lm(model, scales, alpha=0.5)
     model = quantize_model(model)
 
@@ -263,11 +257,15 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
 
     # Load model and tokenizer
     model, tokenizer, config = get_model_and_tokenizer(model_name)
+    # Get original device
+    device = model.device
+    print(f"Original device: {device}")
     # Make each linear layer W8A8
     model = quantize_model(model)
 
     print(f"Loading AWQ results from {awq_results_path}")
-    params_dict = torch.load(awq_results_path, map_location=device)
+    # https://pytorch.org/tutorials/recipes/recipes/module_load_state_dict_tips.html
+    params_dict = torch.load(awq_results_path, mmap=True, weights_only=True, map_location="cpu")
 
     # Test different outlier ratios
     outlier_ratios = [0.01, 0.05, 0.1, 0.25]
@@ -275,7 +273,14 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
         print(f"\nTesting outlier ratio {ratio}:")
 
         # Reload weights - already pseudo quantized
-        model.load_state_dict(params_dict)
+        model.load_state_dict(params_dict, assign=True)
+
+        # Clean up prior weights
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Move model to device
+        model = model.to(device)
 
         print(f"Applying activation quantization (outlier_ratio={ratio})...")
         model = apply_activation_quantization(model, outlier_ratio=ratio)
