@@ -3,6 +3,7 @@ import gc
 import os
 import sys
 from functools import partial
+import json
 
 import torch
 import torch.nn as nn
@@ -146,155 +147,6 @@ def get_calib_feat(model, tokenizer):
 
 
 @torch.no_grad()
-def scale_ln_fcs(ln, fcs, scales):
-    if not isinstance(fcs, list):
-        fcs = [fcs]
-
-    scales = scales.to(ln.weight.device)
-
-    ln.weight.div_(scales)
-    if hasattr(ln, "bias") and ln.bias is not None:
-        ln.bias.div_(scales)
-
-    for fc in fcs:
-        fc.weight.mul_(scales.view(1, -1))
-
-    for p in ln.parameters():
-        assert torch.isnan(p).sum() == 0
-    for fc in fcs:
-        for p in fc.parameters():
-            assert torch.isnan(p).sum() == 0
-
-
-@torch.no_grad()
-def scale_fc_fc(fc1, fc2, scales):
-    assert isinstance(fc1, W8A8Linear)
-    assert isinstance(fc2, W8A8Linear)
-
-    scales = scales.to(fc1.weight.device)
-
-    # fc1.weight.div_(scales.view(-1, 1))
-    fc1.weight[-scales.size(0) :].div_(scales.view(-1, 1))
-    if fc1.bias is not None:
-        fc1.bias.div_(scales.view(-1))
-
-    fc2.weight.mul_(scales.view(1, -1))
-
-    for p in fc1.parameters():
-        assert torch.isnan(p).sum() == 0
-    for p in fc2.parameters():
-        assert torch.isnan(p).sum() == 0
-
-
-@torch.no_grad()
-def auto_scale_block(module, name, w_bit, q_group_size, input_feat):
-    # find the best scale ratio
-    def _search_module_scale(block, linears2scale: list, x, kwargs={}):
-        x = x.to(next(block.parameters()).device)
-        with torch.no_grad():
-            org_out = block(x, **kwargs)
-            if isinstance(org_out, tuple):
-                org_out = org_out[0]
-
-        s_x = x.view(-1, x.shape[-1]).abs().mean(0)
-
-        ############### YOUR CODE STARTS HERE ###############
-
-        # Step 1: Initialize the best_error, best_ratio and best_scales
-        best_error = float("inf")
-        best_ratio = -1
-        best_scales = torch.ones(s_x.shape).view(1, -1)
-
-        ############### YOUR CODE ENDS HERE #################
-
-        n_grid = 20
-        history = []
-
-        org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
-        for ratio in tqdm.tqdm(range(n_grid)):
-            # ratio is the \alpha in the formula
-            ratio = ratio * 1 / n_grid
-
-            ############### YOUR CODE STARTS HERE ###############
-
-            # Step 2: Calculate the scales by the formula: scales = s_x^ratio
-            scales = (s_x**ratio).clamp(min=1e-4)
-            assert scales.shape == s_x.shape
-
-            ############### YOUR CODE ENDS HERE #################
-
-            scales = scales / (scales.max() * scales.min()).sqrt().view(1, -1)
-
-            for fc in linears2scale:
-                scales = scales.to(fc.weight.device)
-
-                # Scale up the values of the weight channels
-                fc.weight.mul_(scales)
-
-                fc.weight.data = pseudo_quantize_tensor(
-                    fc.weight.data, w_bit, q_group_size
-                )
-
-                ############### YOUR CODE STARTS HERE ###############
-
-                # Step 3: Scale back down the values of the weight channels
-                fc.weight.mul_(1 / scales)
-
-                ############### YOUR CODE ENDS HERE #################
-
-            out = block(x, **kwargs)
-            if isinstance(out, tuple):
-                out = out[0]
-
-            loss = (
-                (org_out - out).float().pow(2).mean().item()
-            )  # float prevents overflow
-            history.append(loss)
-            is_best = loss < best_error
-            if is_best:
-                best_error = loss
-                best_ratio = ratio
-                best_scales = scales
-            block.load_state_dict(org_sd)
-
-        if best_ratio == -1:
-            print(history)
-            raise Exception
-
-        best_scales = best_scales.view(-1)
-
-        assert torch.isnan(best_scales).sum() == 0, best_scales
-        return best_scales.detach()
-
-    # attention input
-    inp = input_feat[name + ".self_attn.out_proj"]
-    inp = torch.cat([x.unsqueeze(0) for x in inp], dim=0).unsqueeze(0)
-    qkv = [module.self_attn.q_proj, module.self_attn.k_proj, module.self_attn.v_proj]
-    final_scales = _search_module_scale(module.self_attn, qkv, inp)
-    scale_ln_fcs(module.self_attn_layer_norm, qkv, final_scales)
-
-    # attn out
-    inp = input_feat[name + ".self_attn.out_proj"]
-    inp = torch.cat([x.unsqueeze(0) for x in inp], dim=0)
-    final_scales = _search_module_scale(
-        module.self_attn.out_proj, [module.self_attn.out_proj], inp
-    )
-    scale_fc_fc(module.self_attn.v_proj, module.self_attn.out_proj, final_scales)
-
-    # fc1
-    inp = input_feat[name + ".fc1"]
-    inp = torch.cat([x.unsqueeze(0) for x in inp], dim=0)
-    final_scales = _search_module_scale(module.fc1, [module.fc1], inp)
-    scale_ln_fcs(module.final_layer_norm, module.fc1, final_scales)
-
-    # fc2
-    inp = input_feat[name + ".fc2"]
-    inp = torch.cat([x.unsqueeze(0) for x in inp], dim=0)
-    final_scales = _search_module_scale(module.fc2, [module.fc2], inp)
-    scale_fc_fc(module.fc1, module.fc2, final_scales)
-
-
-@torch.no_grad()
 def quantize_act_reorder(a, n_bits=4, outlier_ratio=0.5):
     """Quantize activations with reordering for better precision on important values.
 
@@ -353,15 +205,14 @@ def apply_activation_quantization(model, outlier_ratio=0.5):
 
 def quantize_and_save_awq(model_name, output_dir, w_bit=4, seqlen=512):
     """Quantize model using SmoothQuant and AWQ, then save results."""
-    import types
-
     os.makedirs(output_dir, exist_ok=True)
+    results = {}
 
     # Load model and tokenizer
     model, tokenizer, config = get_model_and_tokenizer(model_name)
 
     print("Testing original model perplexity...")
-    test_perplexity(model, tokenizer, seqlen=seqlen)
+    results["original"] = test_perplexity(model, tokenizer, seqlen=seqlen)
 
     # Apply SmoothQuant
     scales_path = os.path.join("./smoothquant/act_scales", config["act_scales"])
@@ -371,6 +222,9 @@ def quantize_and_save_awq(model_name, output_dir, w_bit=4, seqlen=512):
     scales = torch.load(scales_path, map_location=device)
     smooth_lm(model, scales, alpha=0.5)
     model = quantize_model(model)
+
+    print("Testing SmoothQuant model perplexity...")
+    results["smoothquant"] = test_perplexity(model, tokenizer, seqlen=seqlen)
 
     input_feat = get_calib_feat(model, tokenizer)
 
@@ -386,42 +240,21 @@ def quantize_and_save_awq(model_name, output_dir, w_bit=4, seqlen=512):
 
             m.weight.data[:, outlier_indices] *= 2
             m.weight.data = pseudo_quantize_tensor(
-                m.weight.data, n_bit=4, q_group_size=128
+                m.weight.data, n_bit=w_bit, q_group_size=128
             )
             m.weight.data[:, outlier_indices] = m.weight.data[:, outlier_indices] / 2
 
-            def make_forward(module, outlier_ratio):
-                return lambda self, x: forward_with_activation_quant(
-                    self, x, outlier_ratio
-                )
-
-            m.forward = types.MethodType(make_forward(m, 0.05), m)
-
     # Test perplexity
-    test_perplexity(model, tokenizer, seqlen=seqlen)
+    print("Testing SmoothQuant + AWQ model perplexity...")
+    results["awq"] = test_perplexity(model, tokenizer, seqlen=seqlen)
 
     # Save model output
-    model.save_pretrained(output_dir)
+    params_dict = model.state_dict()
+    model_id = model_name.split("/")[-1]
+    torch.save(params_dict, os.path.join(output_dir, f"{model_id}_awq.pt"))
 
-    # Run and save AWQ results
-    # awq_results = run_awq(
-    #     model,
-    #     tokenizer,
-    #     w_bit=w_bit,
-    #     q_config={"zero_point": True, "q_group_size": 128},
-    #     n_samples=128,
-    #     seqlen=seqlen,
-    # )
-
-    # print("Testing AWQ model perplexity...")
-    # model = model.to(device)
-    # test_perplexity(model, tokenizer, seqlen=seqlen)
-
-    # # Save results
-    # os.makedirs(output_dir, exist_ok=True)
-    # model_id = model_name.split("/")[-1]
-    # torch.save(awq_results, os.path.join(output_dir, f"{model_id}_awq.pt"))
-    # print(f"AWQ results saved to {output_dir}")
+    with open(os.path.join("./results", f"{model_id}_results.json"), "w") as f:
+        json.dump(results, f)
 
 
 def load_and_test_model(model_name, awq_results_path, seqlen=2048):
@@ -430,63 +263,19 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
 
     # Load model and tokenizer
     model, tokenizer, config = get_model_and_tokenizer(model_name)
-
-    print("Testing original model perplexity...")
-    results["original"] = test_perplexity(model, tokenizer, seqlen=seqlen)
-
-    print("Applying SmoothQuant...")
-    scales_path = os.path.join("./smoothquant/act_scales", config["act_scales"])
-    if not os.path.exists(scales_path):
-        raise FileNotFoundError(f"Activation scales file not found: {scales_path}")
-
-    scales = torch.load(scales_path, map_location=device)
-    smooth_lm(model, scales, alpha=0.5)
+    # Make each linear layer W8A8
     model = quantize_model(model)
 
-    print("Testing SmoothQuant model perplexity...")
-    results["smoothquant"] = test_perplexity(model, tokenizer, seqlen=seqlen)
-
-    print("Applying AWQ...")
-    # Load AWQ results and apply them
-    # awq_results = torch.load(awq_results_path, map_location=device)
-    # apply_scale(model, awq_results["scale"])
-    # apply_clip(model, awq_results["clip"])
-    # model = model.to(device)
-    input_feat = get_calib_feat(model, tokenizer)
-
-    def _awq_quantize(model, input_feat):
-        for name, module in model.named_modules():
-            if isinstance(module, W8A8Linear):
-                # Apply AWQ
-                importance = sum(input_feat[name]).float()
-                outlier_indices = torch.topk(
-                    importance, int(importance.numel() * 0.01), largest=True
-                ).indices
-                assert outlier_indices.dim() == 1
-
-                module.weight.data[:, outlier_indices] *= 2
-                module.weight.data = pseudo_quantize_tensor(
-                    module.weight.data, n_bit=4, q_group_size=128
-                )
-                module.weight.data[:, outlier_indices] = (
-                    module.weight.data[:, outlier_indices] / 2
-                )
-
-    print("Testing AWQ model perplexity...")
-    results["awq"] = test_perplexity(model, tokenizer, seqlen=seqlen)
+    print(f"Loading AWQ results from {awq_results_path}")
+    params_dict = torch.load(awq_results_path, map_location=device)
 
     # Test different outlier ratios
-    del model
-    torch.cuda.empty_cache()
-
     outlier_ratios = [0.01, 0.05, 0.1, 0.25]
     for ratio in outlier_ratios:
         print(f"\nTesting outlier ratio {ratio}:")
 
-        model, _, _ = get_model_and_tokenizer(model_name)
-        smooth_lm(model, scales, alpha=0.5)
-        model = quantize_model(model)
-        _awq_quantize(model, input_feat)
+        # Reload weights - already pseudo quantized
+        model.load_state_dict(params_dict)
 
         print(f"Applying activation quantization (outlier_ratio={ratio})...")
         model = apply_activation_quantization(model, outlier_ratio=ratio)
@@ -495,10 +284,6 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
         results[f"awq_act_quant_{ratio}"] = test_perplexity(
             model, tokenizer, seqlen=seqlen
         )
-
-        # Clean up
-        del model
-        torch.cuda.empty_cache()
 
     # Print summary of all results
     print("\nSummary of all results:")
@@ -516,7 +301,16 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
     output_dir = "./results"
     os.makedirs(output_dir, exist_ok=True)
     model_id = model_name.split("/")[-1]
-    torch.save(results, os.path.join(output_dir, f"{model_id}_results.pt"))
+
+    # Merge results with existing results
+    if os.path.exists(os.path.join(output_dir, f"{model_id}_results.json")):
+        with open(os.path.join(output_dir, f"{model_id}_results.json"), "r") as f:
+            existing_results = json.load(f)
+
+        results.update(existing_results)
+
+    with open(os.path.join(output_dir, f"{model_id}_results.json"), "w") as f:
+        json.dump(results, f)
 
     return results
 
@@ -538,9 +332,9 @@ def process_all_models(mode, output_dir="./awq_results", w_bit=4, seqlen=2048):
             else:  # test mode
                 model_id = model_name.split("/")[-1]
                 awq_path = os.path.join(output_dir, f"{model_id}_awq.pt")
-                # if not os.path.exists(awq_path):
-                #     print(f"Skipping {model_name}: AWQ results not found at {awq_path}")
-                #     continue
+                if not os.path.exists(awq_path):
+                    print(f"Skipping {model_name}: AWQ results not found at {awq_path}")
+                    continue
 
                 results[model_name] = load_and_test_model(
                     model_name,
@@ -613,11 +407,11 @@ def main():
                 args.model, args.output_dir, w_bit=args.w_bit, seqlen=args.seqlen
             )
         else:  # test mode
-            # if not args.awq_results:
-            #     model_id = args.model.split("/")[-1]
-            #     args.awq_results = os.path.join(args.output_dir, f"{model_id}_awq.pt")
-            #     if not os.path.exists(args.awq_results):
-            #         parser.error(f"AWQ results file not found: {args.awq_results}")
+            if not args.awq_results:
+                model_id = args.model.split("/")[-1]
+                args.awq_results = os.path.join(args.output_dir, f"{model_id}_awq.pt")
+                if not os.path.exists(args.awq_results):
+                    parser.error(f"AWQ results file not found: {args.awq_results}")
 
             load_and_test_model(
                 args.model,
