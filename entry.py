@@ -4,6 +4,7 @@ import os
 import sys
 from functools import partial
 import json
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -141,7 +142,7 @@ def get_calib_feat(model, tokenizer):
 
 
 @torch.no_grad()
-def quantize_act_reorder(a, n_bits=4, outlier_ratio=0.5, reorder_indices=None, unorder_indices=None):
+def quantize_act_reorder(a, n_bits=4, outlier_ratio: Optional[float] = 0.5, reorder_indices: Optional[torch.Tensor] = None, unorder_indices: Optional[torch.Tensor] = None):
     """Quantize activations with reordering for better precision on important values.
 
     Args:
@@ -158,10 +159,17 @@ def quantize_act_reorder(a, n_bits=4, outlier_ratio=0.5, reorder_indices=None, u
     a = a[..., reorder_indices]
 
     # Quantize the activations
-    topk = int(reorder_indices.numel() * outlier_ratio)
-    a_outliers = a[..., :topk].clone()
-    a = pseudo_quantize_tensor(a, n_bit=n_bits, q_group_size=128)
-    a[..., :topk] = a_outliers
+    if outlier_ratio is not None:
+        topk = int(reorder_indices.numel() * outlier_ratio)
+        a_outliers = a[..., :topk].clone()
+        a[..., :topk] = a_outliers
+        a = pseudo_quantize_tensor(a, n_bit=n_bits, q_group_size=128)
+        a[..., :topk] = a_outliers
+    else:
+        topk = 128
+        a[..., :topk] *= 2
+        a = pseudo_quantize_tensor(a, n_bit=n_bits, q_group_size=128)
+        a[..., :topk] /= 2
 
     # Reorder the weight tensor back
     if unorder_indices is None:
@@ -287,7 +295,7 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
     input_feat = get_calib_feat(model, tokenizer)
 
     # Test different outlier ratios
-    outlier_ratios = [0.01, 0.05, 0.1, 0.25]
+    outlier_ratios = [0, 0.01, 0.05, 0.1, 0.25]
     for ratio in outlier_ratios:
         print(f"\nTesting outlier ratio {ratio}:")
 
@@ -302,7 +310,7 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
         model = model.to(device)
 
         print(f"Applying activation quantization (outlier_ratio={ratio})...")
-        model = apply_activation_quantization(model, outlier_ratio=ratio, input_feat=input_feat)
+        model = apply_activation_quantization(model, outlier_ratio=None if ratio == 0 else ratio, input_feat=input_feat)
 
         print("Testing AWQ + activation quantization model perplexity...")
         results[f"awq_act_quant_{ratio}"] = test_perplexity(
