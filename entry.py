@@ -90,7 +90,9 @@ def test_perplexity(model, tokenizer, seqlen=2048):
     nlls = []
 
     for i in tqdm.tqdm(range(nsamples), desc="evaluating..."):
-        batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(model.device)
+        batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(
+            model.device
+        )
         with torch.no_grad():
             lm_logits = model(batch).logits
         shift_logits = lm_logits[:, :-1, :].contiguous().float()
@@ -142,7 +144,14 @@ def get_calib_feat(model, tokenizer):
 
 
 @torch.no_grad()
-def quantize_act_reorder(a, n_bits=4, outlier_ratio: Optional[float] = 0.5, reorder_indices: Optional[torch.Tensor] = None, unorder_indices: Optional[torch.Tensor] = None):
+def quantize_act_reorder(
+    a,
+    n_bits=4,
+    outlier_ratio: Optional[float] = 0.5,
+    reorder_indices: Optional[torch.Tensor] = None,
+    unorder_indices: Optional[torch.Tensor] = None,
+    use_reordering: bool = True,
+):
     """Quantize activations with reordering for better precision on important values.
 
     Args:
@@ -163,12 +172,26 @@ def quantize_act_reorder(a, n_bits=4, outlier_ratio: Optional[float] = 0.5, reor
         topk = int(reorder_indices.numel() * outlier_ratio)
         a_outliers = a[..., :topk].clone()
         a[..., :topk] = a_outliers
+
+        if not use_reordering:
+            a = a[..., unorder_indices]
+
         a = pseudo_quantize_tensor(a, n_bit=n_bits, q_group_size=128)
+
+        if not use_reordering:
+            a = a[..., reorder_indices]
+
         a[..., :topk] = a_outliers
     else:
         topk = 128
         a[..., :topk] *= 2
+
+        if not use_reordering:
+            a = a[..., unorder_indices]
         a = pseudo_quantize_tensor(a, n_bit=n_bits, q_group_size=128)
+        if not use_reordering:
+            a = a[..., reorder_indices]
+
         a[..., :topk] /= 2
 
     # Reorder the weight tensor back
@@ -180,18 +203,37 @@ def quantize_act_reorder(a, n_bits=4, outlier_ratio: Optional[float] = 0.5, reor
 
 
 @torch.no_grad()
-def forward_with_activation_quant(self, x, reorder_indices, unorder_indices, outlier_ratio=0.5):
+def forward_with_activation_quant(
+    self,
+    x,
+    reorder_indices,
+    unorder_indices,
+    outlier_ratio=0.5,
+    use_reordering=True,
+):
     """Modified forward pass with activation quantization."""
-    q_x = self.act_quant(x)
-    q_x = quantize_act_reorder(q_x, n_bits=4, outlier_ratio=outlier_ratio, reorder_indices=reorder_indices, unorder_indices=unorder_indices)
+    q_x = self.act_quant(x)  # 8 bit
+    q_x = quantize_act_reorder(
+        q_x,
+        n_bits=4,
+        outlier_ratio=outlier_ratio,
+        reorder_indices=reorder_indices,
+        unorder_indices=unorder_indices,
+        use_reordering=use_reordering,
+    )
     y = torch.functional.F.linear(q_x, self.weight, self.bias)
 
-    q_y = self.output_quant(y)
-    # q_y = quantize_act_reorder(q_y, n_bits=4, outlier_ratio=outlier_ratio)
+    q_y = self.output_quant(y)  # 8 bit
     return q_y
 
 
-def apply_activation_quantization(model, outlier_ratio=0.5, input_feat=None):
+def apply_activation_quantization(
+    model,
+    outlier_ratio=0.5,
+    input_feat=None,
+    use_reordering=True,
+    use_randomization=True,
+):
     """Apply activation quantization to all W8A8Linear layers."""
     import types
 
@@ -203,14 +245,33 @@ def apply_activation_quantization(model, outlier_ratio=0.5, input_feat=None):
             importance = sum(input_feat[name]).float()
             reorder_indices = torch.argsort(importance, descending=True)
             unorder_indices = torch.argsort(reorder_indices)
+
             # Create a closure to capture the outlier_ratio
-            def make_forward(module, reorder_indices, unorder_indices, outlier_ratio):
+            def make_forward(
+                module,
+                reorder_indices,
+                unorder_indices,
+                outlier_ratio,
+                use_reordering,
+            ):
                 return lambda self, x: forward_with_activation_quant(
-                    self, x, reorder_indices, unorder_indices, outlier_ratio
+                    self,
+                    x,
+                    reorder_indices,
+                    unorder_indices,
+                    outlier_ratio,
+                    use_reordering,
                 )
 
             module.forward = types.MethodType(
-                make_forward(module, reorder_indices, unorder_indices, outlier_ratio), module
+                make_forward(
+                    module,
+                    reorder_indices,
+                    unorder_indices,
+                    outlier_ratio,
+                    use_reordering,
+                ),
+                module,
             )
     return model
 
@@ -283,7 +344,9 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
 
     print(f"Loading AWQ results from {awq_results_path}")
     # https://pytorch.org/tutorials/recipes/recipes/module_load_state_dict_tips.html
-    params_dict = torch.load(awq_results_path, mmap=True, weights_only=True, map_location="cpu")
+    params_dict = torch.load(
+        awq_results_path, mmap=True, weights_only=True, map_location="cpu"
+    )
 
     model.load_state_dict(params_dict, assign=True)
 
@@ -295,9 +358,40 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
     input_feat = get_calib_feat(model, tokenizer)
 
     # Test different outlier ratios
-    outlier_ratios = [0, 0.01, 0.05, 0.1, 0.25]
+    outlier_ratio = 0
+    for use_reordering in [True, False]:
+        print(f"Testing reordering={use_reordering}")
+        print(f"Testing outlier ratio {outlier_ratio} with reordering={use_reordering}:")
+
+        # Reload weights - already pseudo quantized
+        model.load_state_dict(params_dict, assign=True)
+
+        # Clean up prior weights
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Move model to device
+        model = model.to(device)
+
+        print(f"Applying activation quantization (outlier_ratio={outlier_ratio})...")
+        model = apply_activation_quantization(
+            model,
+            outlier_ratio=None if outlier_ratio == 0 else outlier_ratio,
+            input_feat=input_feat,
+            use_reordering=use_reordering,
+        )
+
+        print("Testing AWQ + activation quantization model perplexity...")
+        results[f"awq_act_quant_{outlier_ratio}"] = (
+            test_perplexity(model, tokenizer, seqlen=seqlen)
+        )
+
+
+    outlier_ratios = [0.01, 0.05, 0.1, 0.25]
     for ratio in outlier_ratios:
-        print(f"\nTesting outlier ratio {ratio}:")
+        print(
+            f"\nTesting outlier ratio {ratio}:"
+        )
 
         # Reload weights - already pseudo quantized
         model.load_state_dict(params_dict, assign=True)
@@ -310,11 +404,16 @@ def load_and_test_model(model_name, awq_results_path, seqlen=2048):
         model = model.to(device)
 
         print(f"Applying activation quantization (outlier_ratio={ratio})...")
-        model = apply_activation_quantization(model, outlier_ratio=None if ratio == 0 else ratio, input_feat=input_feat)
+        model = apply_activation_quantization(
+            model,
+            outlier_ratio=None if ratio == 0 else ratio,
+            input_feat=input_feat,
+            use_reordering=use_reordering,
+        )
 
         print("Testing AWQ + activation quantization model perplexity...")
-        results[f"awq_act_quant_{ratio}"] = test_perplexity(
-            model, tokenizer, seqlen=seqlen
+        results[f"awq_act_quant_{ratio}"] = (
+            test_perplexity(model, tokenizer, seqlen=seqlen)
         )
 
     # Save results
