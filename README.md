@@ -1,4 +1,5 @@
 # tinyml
+Algorithm inspired by SmoothQuant, AWQ, QServe, and Atom to progressively quantize LLMs to W4A4 with mixed precision. Tested on the WikiText-2 dataset and achieved less than 0.5 perplexity increase on Llama 2 13b model.
 
 ## Install
 
